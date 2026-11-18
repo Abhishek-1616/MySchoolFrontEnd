@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink: #10233a;
+  --color-brand: #0e7c6b;
+  --color-brand-dark: #0a5a4e;
+  --color-sun: #f4b63f;
+  --color-mist: #f3f6f8;
+  --font-display: "Bricolage Grotesque", system-ui, sans-serif;
+  --font-sans: "DM Sans", system-ui, sans-serif;
+}
+
+body { @apply bg-white font-sans text-ink antialiased; }
+h1, h2, h3, h4 { font-family: var(--font-display); letter-spacing: -0.02em; }
+:focus-visible { outline: 2px solid var(--color-brand); outline-offset: 3px; }
