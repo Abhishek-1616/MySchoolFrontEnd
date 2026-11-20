@@ -1,15 +1,12 @@
+
 name: Frontend CI CD
 
 on:
   push:
-    branches:
-      - develop
-      - main
+    branches: [develop, main]
 
   pull_request:
-    branches:
-      - develop
-      - main
+    branches: [develop, main]
 
   workflow_dispatch:
 
@@ -17,22 +14,21 @@ permissions:
   contents: read
 
 jobs:
-
   ci:
     name: Frontend Validation
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     defaults:
       run:
         working-directory: marketingWebsite
 
     steps:
+      - name: Checkout source code
+        uses: actions/checkout@v5
 
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Configure Node.js
+        uses: actions/setup-node@v5
         with:
           node-version: '22'
           cache: npm
@@ -41,87 +37,75 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run ESLint
-        run: npx --no-install eslint .
+      - name: Run lint
+        run: npm run lint
 
-      - name: Dependency security audit
-        run: npm audit --audit-level=high
-
-      - name: Run frontend tests
+      - name: Run tests if configured
         run: npm run test --if-present
 
-      - name: Build application
+      - name: Build frontend
         run: npm run build
 
-      - name: Verify compiled application
+      - name: Verify build
         run: test -s dist/index.html
+
+      - name: Security audit
+        run: npm audit --audit-level=high
 
   deploy:
     name: Deploy Frontend to EC2
     needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
 
-    if: >
+    if: |
       github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch')
-
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-
-    concurrency:
-      group: school-frontend-deployment
-      cancel-in-progress: false
+       github.event_name == 'workflow_dispatch') &&
+      vars.FRONTEND_DEPLOY_ENABLED == 'true'
 
     permissions:
       contents: read
       id-token: write
 
-    steps:
+    concurrency:
+      group: school-frontend-deployment
+      cancel-in-progress: false
 
+    steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v5
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: Frontend-${{ github.run_id }}
-          role-duration-seconds: 7200
-          retry-max-attempts: 3
 
-      - name: Verify AWS connection
+      - name: Verify AWS identity
         run: aws sts get-caller-identity
 
-      - name: Execute frontend deployment
-        id: ssm
+      - name: Deploy through SSM
+        shell: bash
         env:
           INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name School-Deploy-Frontend \
-            --parameters "CommitSha=$GITHUB_SHA" \
-            --timeout-seconds 600 \
+            --parameters "CommitSha=$COMMIT_SHA" \
+            --comment "Frontend deployment $COMMIT_SHA" \
             --query 'Command.CommandId' \
             --output text)
 
-          echo "command_id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
-          echo "SSM command: $COMMAND_ID"
+          echo "SSM Command ID: $COMMAND_ID"
 
-      - name: Monitor deployment
-        env:
-          INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
-          COMMAND_ID: ${{ steps.ssm.outputs.command_id }}
-        run: |
-          set -euo pipefail
-
-          for i in $(seq 1 500); do
-
+          for attempt in $(seq 1 120); do
             STATUS=$(aws ssm get-command-invocation \
               --command-id "$COMMAND_ID" \
               --instance-id "$INSTANCE_ID" \
               --query Status \
-              --output text 2>/dev/null) || STATUS="Pending"
+              --output text 2>/dev/null || true)
 
             echo "Deployment status: $STATUS"
 
@@ -129,17 +113,10 @@ jobs:
               Success)
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
-                  --instance-id "$INSTANCE_ID" \
-                  --query StandardOutputContent \
-                  --output text
+                  --instance-id "$INSTANCE_ID"
                 exit 0
                 ;;
-
-              Pending|InProgress|Delayed|Cancelling)
-                sleep 10
-                ;;
-
-              *)
+              Failed|Cancelled|TimedOut|Cancelling)
                 aws ssm get-command-invocation \
                   --command-id "$COMMAND_ID" \
                   --instance-id "$INSTANCE_ID"
@@ -147,21 +124,15 @@ jobs:
                 ;;
             esac
 
+            sleep 10
           done
 
-          echo "Deployment monitoring timed out"
+          echo "Deployment verification timed out"
           exit 1
 
-      - name: Verify public website
+      - name: Verify public HTTPS website
         run: |
-          curl -fsS \
-            --retry 3 \
-            --max-time 30 \
+          curl -fsS --retry 3 \
+            --max-time 20 \
             https://school.myschool4u.in/ \
             -o /dev/null
-
-      - name: Deployment summary
-        run: |
-          echo "## Frontend Deployment Successful" >> "$GITHUB_STEP_SUMMARY"
-          echo "Commit: $GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
-          echo "Website: https://school.myschool4u.in/" >> "$GITHUB_STEP_SUMMARY"
