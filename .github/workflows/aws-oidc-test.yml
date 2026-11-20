@@ -13,26 +13,97 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
 
+    env:
+      AWS_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+
     steps:
-      - name: Inspect OIDC subject
+      - name: Diagnose GitHub OIDC and AWS STS
         shell: bash
         run: |
           python3 - <<'PY'
-          import os, json, urllib.request, base64
+          import os
+          import json
+          import urllib.request
+          import base64
+          import subprocess
+          import tempfile
+
           url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
           sep = "&" if "?" in url else "?"
-          req = urllib.request.Request(
+
+          request = urllib.request.Request(
               url + sep + "audience=sts.amazonaws.com",
-              headers={"Authorization": "Bearer " +
-                       os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]}
+              headers={
+                  "Authorization": "Bearer " +
+                  os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
+              }
           )
-          token = json.load(urllib.request.urlopen(req))["value"]
+
+          token = json.load(
+              urllib.request.urlopen(request)
+          )["value"]
+
+          print(f"::add-mask::{token}")
+
           payload = token.split(".")[1]
-          claims = json.loads(base64.urlsafe_b64decode(
-              payload + "=" * (-len(payload) % 4)
-          ))
-          print("OIDC subject:", claims["sub"])
-          print("OIDC audience:", claims["aud"])
+
+          claims = json.loads(
+              base64.urlsafe_b64decode(
+                  payload + "=" * (-len(payload) % 4)
+              )
+          )
+
+          print("\n===== ACTUAL GITHUB OIDC CLAIMS =====")
+
+          for key in [
+              "iss", "aud", "sub", "repository",
+              "repository_id", "repository_owner",
+              "repository_owner_id", "ref",
+              "event_name", "workflow_ref",
+              "environment"
+          ]:
+              print(f"{key}: {claims.get(key)}")
+
+          print("\n===== AWS CONFIGURATION =====")
+          print("Role:", os.environ["AWS_ROLE_ARN"])
+          print("Region:", os.environ["AWS_REGION"])
+
+          with tempfile.TemporaryDirectory() as folder:
+              path = os.path.join(folder, "oidc-token")
+              with open(path, "w") as file:
+                  file.write(token)
+              os.chmod(path, 0o600)
+
+              result = subprocess.run(
+                  [
+                      "aws", "sts",
+                      "assume-role-with-web-identity",
+                      "--role-arn",
+                      os.environ["AWS_ROLE_ARN"],
+                      "--role-session-name",
+                      "GitHubOIDCDiagnostic",
+                      "--web-identity-token",
+                      "file://" + path,
+                      "--duration-seconds", "900",
+                      "--region",
+                      os.environ["AWS_REGION"],
+                      "--query", "AssumedRoleUser",
+                      "--output", "json"
+                  ],
+                  capture_output=True,
+                  text=True
+              )
+
+              print("\n===== DIRECT AWS STS RESULT =====")
+
+              if result.returncode != 0:
+                  print(result.stderr)
+                  raise SystemExit(result.returncode)
+
+              print(result.stdout)
+              print("SUCCESS: AWS accepted the OIDC token.")
+
           PY
 
       - name: Configure AWS credentials
@@ -41,6 +112,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: GitHubOIDCTest
+          retry-max-attempts: 1
 
       - name: Verify AWS connection
         run: aws sts get-caller-identity
